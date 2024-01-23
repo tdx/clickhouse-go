@@ -19,10 +19,11 @@ package column
 
 import (
 	"fmt"
-	"github.com/ClickHouse/ch-go/proto"
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/ClickHouse/ch-go/proto"
 )
 
 type offset struct {
@@ -264,12 +265,120 @@ func (col *Array) WriteStatePrefix(buffer *proto.Buffer) error {
 
 func (col *Array) ScanRow(dest any, row int) error {
 	elem := reflect.Indirect(reflect.ValueOf(dest))
-	value, err := col.scan(elem.Type(), row)
+	value, err := col.scan2(elem.Type(), elem, row)
 	if err != nil {
 		return err
 	}
 	elem.Set(value)
 	return nil
+}
+
+func (col *Array) scan2(
+	sliceType reflect.Type,
+	sliceDest reflect.Value,
+	row int,
+) (reflect.Value, error) {
+	switch col.values.(type) {
+	case *Tuple:
+		subSlice, err := col.scanSliceOfObjects(sliceType, row)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return subSlice, nil
+	default:
+		subSlice, err := col.scanSlice2(sliceType, sliceDest, row, 0)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return subSlice, nil
+	}
+}
+
+func (col *Array) scanSlice2(
+	sliceType reflect.Type,
+	sliceDest reflect.Value,
+	row int,
+	level int,
+) (reflect.Value, error) {
+	// We could try and set - if it exceeds just return immediately
+	offset := col.offsets[level]
+	var (
+		end   = offset.values.col.Row(row)
+		start = uint64(0)
+	)
+	if row > 0 {
+		start = offset.values.col.Row(row - 1)
+	}
+	base := offset.scanType.Elem()
+	isPtr := base.Kind() == reflect.Ptr
+
+	var rSlice reflect.Value
+	switch sliceType.Kind() {
+	case reflect.Interface:
+		sliceType = offset.scanType
+		rSlice = reflect.MakeSlice(sliceType, 0, int(end-start))
+	case reflect.Slice:
+		// rSlice = reflect.MakeSlice(sliceType, 0, int(end-start))
+		rSlice = sliceDest
+	default:
+		return reflect.Value{}, &Error{
+			ColumnType: fmt.Sprint(sliceType.Kind()),
+			Err:        fmt.Errorf("column %s - needs a slice or any", col.Name()),
+		}
+	}
+
+	for i := start; i < end; i++ {
+		var value reflect.Value
+		var err error
+		switch {
+		case level == len(col.offsets)-1:
+			switch dcol := col.values.(type) {
+			case *Nested:
+				//Array(Nested
+				aCol := dcol.Interface.(*Array)
+				value, err = aCol.scanSliceOfObjects(sliceType.Elem(), int(i))
+				if err != nil {
+					return reflect.Value{}, err
+				}
+			case *Array:
+				//Array(Array
+				value, err = dcol.scanSlice(sliceType.Elem(), int(i), 0)
+				if err != nil {
+					return reflect.Value{}, err
+				}
+			case *Tuple:
+				// Array(Tuple possible outside JSON object cases e.g. if the user defines a  Array(Array( Tuple(String, Int64) ))
+				value, err = dcol.scan(sliceType.Elem(), int(i))
+				if err != nil {
+					return reflect.Value{}, err
+				}
+			default:
+				v := col.values.Row(int(i), isPtr)
+				val := reflect.ValueOf(v)
+				if v == nil {
+					val = reflect.Zero(base)
+				}
+				if sliceType.Kind() == reflect.Interface {
+					value = reflect.New(sliceType).Elem()
+					if err := setJSONFieldValue(value, val); err != nil {
+						return reflect.Value{}, err
+					}
+				} else {
+					value = reflect.New(sliceType.Elem()).Elem()
+					if err := setJSONFieldValue(value, val); err != nil {
+						return reflect.Value{}, err
+					}
+				}
+			}
+		default:
+			value, err = col.scanSlice(sliceType.Elem(), int(i), level+1)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+		}
+		rSlice = reflect.Append(rSlice, value)
+	}
+	return rSlice, nil
 }
 
 func (col *Array) scan(sliceType reflect.Type, row int) (reflect.Value, error) {
